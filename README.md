@@ -36,5 +36,5 @@ No market data is included. You'll need your own MBO files from Databento.
 ## Speed
 
 On my machine, a release build replayed a 79 MiB ES day (about 5.0 million
-records) with full book updates at roughly 6.8 to 6.9 million records per
+records) with full book updates at roughly 6.7 to 6.9 million records per
 second. Your numbers will depend on your hardware and the file.
