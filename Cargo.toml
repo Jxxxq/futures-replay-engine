@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/engine-core",
+    "crates/engine-testkit",
+    "crates/engine-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+version = "0.1.0"
+
