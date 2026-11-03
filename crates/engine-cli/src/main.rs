@@ -34,9 +34,14 @@ fn main() -> ExitCode {
                 }
             }
         }
-        _ => {
+        "help" | "--help" | "-h" => {
             print_help();
             ExitCode::SUCCESS
+        }
+        unknown => {
+            eprintln!("unknown command: {unknown}");
+            print_help();
+            ExitCode::from(2)
         }
     }
 }

@@ -321,11 +321,11 @@ impl EventAssembler {
             .unwrap_or_default()
     }
 
-    /// how many separate orders are resting at `price`, as of the event you're
-    /// asking about.
+    /// how many separate orders are resting at `price` in the book right now.
     ///
-    /// returns nothing if that stream doesn't exist or the book has been reset
-    /// since the event, so call it right after `ingest` hands the event back.
+    /// returns nothing if that stream doesn't exist or the book was reset after
+    /// the event the key came from. it can't rewind later events, so call it
+    /// right after `ingest` hands the event back if you want that event's count.
     pub fn book_order_count_at_price(
         &self,
         stream_key: &StreamKey,

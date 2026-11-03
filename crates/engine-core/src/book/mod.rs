@@ -672,4 +672,22 @@ mod tests {
         ));
         assert_eq!(book.snapshot(), before);
     }
+
+    #[test]
+    fn unknown_orders_are_rejected_without_changing_the_book() {
+        let mut book = DisplayedBook::new(InstrumentId::new(1));
+        book.apply(&record(MboAction::Add, MboSide::Bid, 1, 100, 5))
+            .unwrap();
+        let before = book.snapshot();
+
+        assert_eq!(
+            book.apply(&record(MboAction::Cancel, MboSide::Bid, 2, 100, 1)),
+            Err(BookError::MissingOrder(OrderId::new(2)))
+        );
+        assert_eq!(
+            book.apply(&record(MboAction::Modify, MboSide::Bid, 2, 100, 1)),
+            Err(BookError::MissingOrder(OrderId::new(2)))
+        );
+        assert_eq!(book.snapshot(), before);
+    }
 }

@@ -8,6 +8,13 @@ pub struct FastHasher {
     state: u64,
 }
 
+impl FastHasher {
+    #[inline]
+    fn add(&mut self, value: u64) {
+        self.state = self.state.rotate_left(5) ^ value;
+    }
+}
+
 impl Hasher for FastHasher {
     #[inline]
     fn finish(&self) -> u64 {
@@ -21,32 +28,32 @@ impl Hasher for FastHasher {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        self.state = hash;
+        self.add(hash);
     }
 
     #[inline]
     fn write_u8(&mut self, i: u8) {
-        self.state = u64::from(i);
+        self.add(u64::from(i));
     }
 
     #[inline]
     fn write_u16(&mut self, i: u16) {
-        self.state = u64::from(i);
+        self.add(u64::from(i));
     }
 
     #[inline]
     fn write_u32(&mut self, i: u32) {
-        self.state = u64::from(i);
+        self.add(u64::from(i));
     }
 
     #[inline]
     fn write_u64(&mut self, i: u64) {
-        self.state = i;
+        self.add(i);
     }
 
     #[inline]
     fn write_usize(&mut self, i: usize) {
-        self.state = i as u64;
+        self.add(i as u64);
     }
 }
 
@@ -72,5 +79,26 @@ mod tests {
 
         assert_ne!(first.finish(), second.finish());
         assert_eq!(first.finish(), first.finish());
+    }
+
+    #[test]
+    fn every_field_of_a_key_changes_the_hash() {
+        use crate::types::{InstrumentId, InstrumentKey, PublisherId};
+        use std::hash::BuildHasher;
+
+        let build = BuildHasherDefault::<FastHasher>::default();
+        let key = |instrument: u32, epoch: &str| InstrumentKey {
+            dataset: "GLBX.MDP3".to_string(),
+            publisher_id: PublisherId::new(1),
+            instrument_id: InstrumentId::new(instrument),
+            symbol_epoch: epoch.to_string(),
+        };
+
+        assert_ne!(build.hash_one(key(1, "a")), build.hash_one(key(2, "a")));
+        assert_ne!(build.hash_one(key(1, "a")), build.hash_one(key(1, "b")));
+        assert_ne!(
+            build.hash_one((1_u16, 7_u32)),
+            build.hash_one((2_u16, 7_u32))
+        );
     }
 }

@@ -212,12 +212,15 @@ where
     {
         let ordinal = decoded_records;
         decoded_records += 1;
-        let Some(mbo) = record_ref.get::<MboMsg>() else {
+        if !record_ref.has::<MboMsg>() {
             return Err(DbnMboStreamError::UnexpectedRecordType {
                 ordinal,
                 rtype: record_ref.header().rtype,
             });
-        };
+        }
+        let mbo = record_ref
+            .try_get::<MboMsg>()
+            .map_err(DbnMboStreamError::Dbn)?;
         let record = convert_mbo_msg(mbo, RecordOrdinal::new(ordinal))
             .map_err(|source| DbnMboStreamError::Conversion { ordinal, source })?;
         if record.flags.is_tob() || record.flags.is_mbp() {
