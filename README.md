@@ -138,5 +138,4 @@ crates/engine-cli      the replay-smoke command-line tool
 
 ## License
 
-All rights reserved. You're welcome to read the code, but it isn't licensed
-for reuse.
+MIT. See [LICENSE](LICENSE).
