@@ -3,15 +3,21 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::thread;
 
-use dbn::decode::{DbnDecoder, DbnMetadata, DecodeRecordRef};
-use dbn::{MboMsg, Metadata, Record, Schema};
+use dbn::decode::{DbnDecoder, DbnMetadata, DecodeRecordRef, DynReader};
+use dbn::{Compression, MboMsg, Metadata, Record, Schema};
 
 use super::mbo_convert::{convert_mbo_msg, DbnConversionError};
 use crate::mbo::{EngineMboRecord, MboAction};
 use crate::types::{InstrumentId, PublisherId, RecordOrdinal};
 
 const DBN_FILE_READ_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// the zstd thread hands bytes to the decoder in chunks this big, and only
+/// this many can be waiting at once, so memory stays flat on big files.
+const DECOMPRESSED_CHUNK_BYTES: usize = 256 * 1024;
+const DECOMPRESSED_CHUNKS_QUEUED: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DbnMboMetadata {
@@ -179,11 +185,86 @@ where
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("zst"))
     {
-        let decoder = DbnDecoder::with_zstd_buffer(reader).map_err(DbnMboStreamError::Dbn)?;
-        stream_from_decoder(decoder, input_bytes, on_record)
+        // unpacking zstd takes about as long as the book work, so it runs on
+        // its own thread. records still come out in file order.
+        thread::scope(|scope| {
+            let (sender, receiver) = mpsc::sync_channel(DECOMPRESSED_CHUNKS_QUEUED);
+            scope.spawn(move || decompress_into(reader, &sender));
+            let decoder =
+                DbnDecoder::new(ChunkReader::new(receiver)).map_err(DbnMboStreamError::Dbn)?;
+            stream_from_decoder(decoder, input_bytes, on_record)
+        })
     } else {
         let decoder = DbnDecoder::new(reader).map_err(DbnMboStreamError::Dbn)?;
         stream_from_decoder(decoder, input_bytes, on_record)
+    }
+}
+
+/// runs on the zstd thread. unpacks the file and sends the bytes over a chunk
+/// at a time. if a read fails it sends what it already has and then the
+/// error. if the decoder has stopped listening it just quits.
+fn decompress_into(reader: BufReader<File>, chunks: &SyncSender<io::Result<Vec<u8>>>) {
+    let mut decompressed = match DynReader::with_buffer(reader, Compression::Zstd) {
+        Ok(decompressed) => decompressed,
+        Err(error) => {
+            let _ = chunks.send(Err(io::Error::other(error)));
+            return;
+        }
+    };
+    loop {
+        let mut chunk = Vec::with_capacity(DECOMPRESSED_CHUNK_BYTES);
+        let result = (&mut decompressed)
+            .take(DECOMPRESSED_CHUNK_BYTES as u64)
+            .read_to_end(&mut chunk);
+        if !chunk.is_empty() && chunks.send(Ok(chunk)).is_err() {
+            return;
+        }
+        match result {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error) => {
+                let _ = chunks.send(Err(error));
+                return;
+            }
+        }
+    }
+}
+
+/// reads the chunks back in order on the decoder's side.
+///
+/// the channel closing means the file is done. a read error comes through as
+/// an `Err` chunk before that, and if the zstd thread panics the scope panics
+/// too, so a broken file can't look like a normal end.
+struct ChunkReader {
+    chunks: Receiver<io::Result<Vec<u8>>>,
+    current: Vec<u8>,
+    position: usize,
+}
+
+impl ChunkReader {
+    fn new(chunks: Receiver<io::Result<Vec<u8>>>) -> Self {
+        Self {
+            chunks,
+            current: Vec::new(),
+            position: 0,
+        }
+    }
+}
+
+impl Read for ChunkReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.position == self.current.len() {
+            let Ok(chunk) = self.chunks.recv() else {
+                return Ok(0);
+            };
+            self.current = chunk?;
+            self.position = 0;
+        }
+        let available = &self.current[self.position..];
+        let count = available.len().min(out.len());
+        out[..count].copy_from_slice(&available[..count]);
+        self.position += count;
+        Ok(count)
     }
 }
 
@@ -515,5 +596,58 @@ mod tests {
                 source: "intentional stop"
             })
         ));
+    }
+
+    /// enough records to need several chunks.
+    fn many_records() -> Vec<MboMsg> {
+        let count = (3 * DECOMPRESSED_CHUNK_BYTES / std::mem::size_of::<MboMsg>()) as u32;
+        (1..=count)
+            .map(|sequence| {
+                mbo(
+                    sequence,
+                    b'A',
+                    if sequence % 2 == 0 { b'B' } else { b'A' },
+                    u64::from(sequence).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                    5_000_000_000_000 + i64::from(sequence % 97) * 250_000_000,
+                    1 + sequence % 13,
+                    F_LAST,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn streams_zstd_files_bigger_than_one_chunk_in_order() {
+        let plain = TempDbn::new("dbn");
+        let compressed = TempDbn::new("dbn.zst");
+        let records = many_records();
+        write_fixture(plain.path(), Schema::Mbo, &records, false);
+        write_fixture(compressed.path(), Schema::Mbo, &records, true);
+
+        let (_, plain_records) = read_fixture(plain.path());
+        let (summary, compressed_records) = read_fixture(compressed.path());
+
+        assert_eq!(summary.mbo_records, records.len() as u64);
+        assert_eq!(compressed_records, plain_records);
+        assert!(compressed_records
+            .iter()
+            .enumerate()
+            .all(|(index, record)| record.ordinal.get() == index as u64));
+    }
+
+    #[test]
+    fn rejects_a_damaged_zstd_file() {
+        let path = TempDbn::new("dbn.zst");
+        write_fixture(path.path(), Schema::Mbo, &many_records(), true);
+        let mut bytes = fs::read(path.path()).unwrap();
+        let middle = bytes.len() / 2;
+        for byte in &mut bytes[middle..middle + 8] {
+            *byte = !*byte;
+        }
+        fs::write(path.path(), bytes).unwrap();
+
+        let result = stream_mbo_records_from_dbn(path.path(), |_| Ok::<(), ()>(()));
+
+        assert!(result.is_err());
     }
 }
