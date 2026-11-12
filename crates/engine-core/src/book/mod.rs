@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{btree_map, hash_map, BTreeMap};
 
 use crate::fast_hash::FastHashMap;
 use crate::mbo::{EngineMboRecord, MboAction, MboSide};
@@ -91,14 +91,22 @@ impl BookSnapshot {
     }
 }
 
+/// one price level: the total size resting there and how many orders that is.
+/// kept together so a message only has to find its price once.
+#[derive(Clone, Copy, Debug)]
+struct Level {
+    qty: Qty,
+    order_count: usize,
+}
+
+type Levels = BTreeMap<Px9, Level>;
+
 #[derive(Clone, Debug)]
 pub struct DisplayedBook {
     instrument_id: InstrumentId,
     orders: FastHashMap<OrderId, RestingOrder>,
-    bids: BTreeMap<Px9, Qty>,
-    asks: BTreeMap<Px9, Qty>,
-    bid_order_counts: BTreeMap<Px9, usize>,
-    ask_order_counts: BTreeMap<Px9, usize>,
+    bids: Levels,
+    asks: Levels,
 }
 
 impl DisplayedBook {
@@ -108,8 +116,6 @@ impl DisplayedBook {
             orders: FastHashMap::default(),
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            bid_order_counts: BTreeMap::new(),
-            ask_order_counts: BTreeMap::new(),
         }
     }
 
@@ -141,12 +147,12 @@ impl DisplayedBook {
         let (best_bid_px, best_bid_qty) = self
             .bids
             .last_key_value()
-            .map(|(price, qty)| (Some(*price), *qty))
+            .map(|(price, level)| (Some(*price), level.qty))
             .unwrap_or((None, Qty::new(0)));
         let (best_ask_px, best_ask_qty) = self
             .asks
             .first_key_value()
-            .map(|(price, qty)| (Some(*price), *qty))
+            .map(|(price, level)| (Some(*price), level.qty))
             .unwrap_or((None, Qty::new(0)));
 
         BookSnapshot {
@@ -167,11 +173,11 @@ impl DisplayedBook {
     /// the book, so it has no effect on queue position, fills, or updates.
     pub fn order_count_at_price(&self, side: MboSide, price: Px9) -> usize {
         match side {
-            MboSide::Bid => self.bid_order_counts.get(&price).copied(),
-            MboSide::Ask => self.ask_order_counts.get(&price).copied(),
+            MboSide::Bid => self.bids.get(&price),
+            MboSide::Ask => self.asks.get(&price),
             MboSide::None => None,
         }
-        .unwrap_or(0)
+        .map_or(0, |level| level.order_count)
     }
 
     pub fn depth(&self, side: MboSide) -> Vec<BookLevel> {
@@ -186,18 +192,18 @@ impl DisplayedBook {
         }));
         match side {
             MboSide::Bid => {
-                for (price, qty) in self.bids.iter().rev().take(max_levels) {
+                for (price, level) in self.bids.iter().rev().take(max_levels) {
                     levels.push(BookLevel {
                         price_px9: *price,
-                        qty: *qty,
+                        qty: level.qty,
                     });
                 }
             }
             MboSide::Ask => {
-                for (price, qty) in self.asks.iter().take(max_levels) {
+                for (price, level) in self.asks.iter().take(max_levels) {
                     levels.push(BookLevel {
                         price_px9: *price,
-                        qty: *qty,
+                        qty: level.qty,
                     });
                 }
             }
@@ -213,13 +219,13 @@ impl DisplayedBook {
                 .iter()
                 .rev()
                 .take(max_levels)
-                .find_map(|(level_price, qty)| (*level_price == price).then_some(*qty))
+                .find_map(|(level_price, level)| (*level_price == price).then_some(level.qty))
                 .unwrap_or_else(|| Qty::new(0)),
             MboSide::Ask => self
                 .asks
                 .iter()
                 .take(max_levels)
-                .find_map(|(level_price, qty)| (*level_price == price).then_some(*qty))
+                .find_map(|(level_price, level)| (*level_price == price).then_some(level.qty))
                 .unwrap_or_else(|| Qty::new(0)),
             MboSide::None => Qty::new(0),
         }
@@ -235,19 +241,19 @@ impl DisplayedBook {
 
         match side {
             MboSide::Bid => {
-                for (price, qty) in self.bids.iter().rev().take(N) {
+                for (price, level) in self.bids.iter().rev().take(N) {
                     levels[len] = BookLevel {
                         price_px9: *price,
-                        qty: *qty,
+                        qty: level.qty,
                     };
                     len += 1;
                 }
             }
             MboSide::Ask => {
-                for (price, qty) in self.asks.iter().take(N) {
+                for (price, level) in self.asks.iter().take(N) {
                     levels[len] = BookLevel {
                         price_px9: *price,
-                        qty: *qty,
+                        qty: level.qty,
                     };
                     len += 1;
                 }
@@ -262,74 +268,93 @@ impl DisplayedBook {
         self.orders.clear();
         self.bids.clear();
         self.asks.clear();
-        self.bid_order_counts.clear();
-        self.ask_order_counts.clear();
     }
 
     fn add_order(&mut self, record: &EngineMboRecord) -> Result<BookMutation, BookError> {
         Self::validate_resting_record(record)?;
-        if self.orders.contains_key(&record.order_id) {
+        let hash_map::Entry::Vacant(order_slot) = self.orders.entry(record.order_id) else {
             return Err(BookError::DuplicateOrder(record.order_id));
-        }
+        };
 
-        let next_level_qty = self.checked_level_add(record.side, record.price_px9, record.size)?;
-        let order = RestingOrder {
+        match side_levels(&mut self.bids, &mut self.asks, record.side).entry(record.price_px9) {
+            btree_map::Entry::Occupied(mut level_slot) => {
+                let level = level_slot.get_mut();
+                level.qty = level_add(level.qty, record.size, record.side, record.price_px9)?;
+                level.order_count = level
+                    .order_count
+                    .checked_add(1)
+                    .expect("a price-level order count cannot exceed the total order map capacity");
+            }
+            btree_map::Entry::Vacant(level_slot) => {
+                level_slot.insert(Level {
+                    qty: record.size,
+                    order_count: 1,
+                });
+            }
+        }
+        order_slot.insert(RestingOrder {
             order_id: record.order_id,
             side: record.side,
             price_px9: record.price_px9,
             size: record.size,
             priority_sequence: record.sequence,
-        };
-        self.set_level_qty(order.side, order.price_px9, next_level_qty);
-        self.increment_level_order_count(order.side, order.price_px9);
-        self.orders.insert(order.order_id, order);
+        });
         Ok(BookMutation::Added)
     }
 
     fn cancel_order(&mut self, record: &EngineMboRecord) -> Result<BookMutation, BookError> {
-        let order = self
-            .orders
-            .get(&record.order_id)
-            .cloned()
-            .ok_or(BookError::MissingOrder(record.order_id))?;
+        let hash_map::Entry::Occupied(mut order_slot) = self.orders.entry(record.order_id) else {
+            return Err(BookError::MissingOrder(record.order_id));
+        };
+        let order = order_slot.get();
+        let (side, price, resting) = (order.side, order.price_px9, order.size);
 
         let cancel_qty = record.size;
         if cancel_qty.is_zero() {
             return Err(BookError::ZeroSize);
         }
-        if record.side != order.side {
+        if record.side != side {
             return Err(BookError::CancelSideMismatch {
                 order_id: record.order_id,
-                expected: order.side,
+                expected: side,
                 actual: record.side,
             });
         }
-        if record.price_px9 != order.price_px9 {
+        if record.price_px9 != price {
             return Err(BookError::CancelPriceMismatch {
                 order_id: record.order_id,
-                expected: order.price_px9,
+                expected: price,
                 actual: record.price_px9,
             });
         }
-        if cancel_qty > order.size {
+        if cancel_qty > resting {
             return Err(BookError::CancelExceedsResting {
                 order_id: record.order_id,
-                resting: order.size,
+                resting,
                 cancel: cancel_qty,
             });
         }
 
-        let next_level_qty = self.checked_level_sub(order.side, order.price_px9, cancel_qty)?;
-        let remaining = order.size.get() - cancel_qty.get();
-        self.set_level_qty(order.side, order.price_px9, next_level_qty);
+        let btree_map::Entry::Occupied(mut level_slot) =
+            side_levels(&mut self.bids, &mut self.asks, side).entry(price)
+        else {
+            return Err(missing_level(side, price, cancel_qty));
+        };
+        let level = level_slot.get_mut();
+        level.qty = level_sub(level.qty, cancel_qty, side, price)?;
+
+        let remaining = resting.get() - cancel_qty.get();
         if remaining > 0 {
-            self.orders
-                .get_mut(&record.order_id)
-                .expect("validated order remains present")
-                .size = Qty::new(remaining);
+            order_slot.get_mut().size = Qty::new(remaining);
         } else {
-            self.orders.remove(&record.order_id);
-            self.decrement_level_order_count(order.side, order.price_px9);
+            order_slot.remove();
+            level.order_count = level
+                .order_count
+                .checked_sub(1)
+                .expect("resting price-level order count cannot underflow");
+            if level.order_count == 0 {
+                level_slot.remove();
+            }
         }
 
         Ok(BookMutation::Cancelled)
@@ -339,8 +364,7 @@ impl DisplayedBook {
         Self::validate_resting_record(record)?;
         let order = self
             .orders
-            .get(&record.order_id)
-            .cloned()
+            .get_mut(&record.order_id)
             .ok_or(BookError::MissingOrder(record.order_id))?;
         if record.side != order.side {
             return Err(BookError::ModifySideChange {
@@ -350,35 +374,56 @@ impl DisplayedBook {
             });
         }
 
-        let (old_level_qty, new_level_qty) = if record.price_px9 == order.price_px9 {
-            let after_remove = self.checked_level_sub(order.side, order.price_px9, order.size)?;
-            let after_add = after_remove.get().checked_add(record.size.get()).ok_or(
-                BookError::LevelQuantityOverflow {
-                    side: order.side,
-                    price: order.price_px9,
-                },
-            )?;
-            (None, Qty::new(after_add))
+        let side = order.side;
+        let levels = side_levels(&mut self.bids, &mut self.asks, side);
+        if record.price_px9 == order.price_px9 {
+            let price = order.price_px9;
+            let level = levels
+                .get_mut(&price)
+                .ok_or(missing_level(side, price, order.size))?;
+            let after_remove = level_sub(level.qty, order.size, side, price)?;
+            level.qty = level_add(after_remove, record.size, side, price)?;
         } else {
-            (
-                Some(self.checked_level_sub(order.side, order.price_px9, order.size)?),
-                self.checked_level_add(record.side, record.price_px9, record.size)?,
-            )
-        };
+            // check both levels before touching either one, so a rejected
+            // modify doesn't leave the book half changed.
+            let new_level_qty = levels
+                .get(&record.price_px9)
+                .map_or(Qty::new(0), |level| level.qty);
+            let btree_map::Entry::Occupied(mut old_slot) = levels.entry(order.price_px9) else {
+                return Err(missing_level(side, order.price_px9, order.size));
+            };
+            let after_remove = level_sub(old_slot.get().qty, order.size, side, order.price_px9)?;
+            let after_add = level_add(new_level_qty, record.size, side, record.price_px9)?;
 
-        if let Some(qty) = old_level_qty {
-            self.set_level_qty(order.side, order.price_px9, qty);
-            self.decrement_level_order_count(order.side, order.price_px9);
-            self.increment_level_order_count(record.side, record.price_px9);
+            let old_level = old_slot.get_mut();
+            old_level.qty = after_remove;
+            old_level.order_count = old_level
+                .order_count
+                .checked_sub(1)
+                .expect("resting price-level order count cannot underflow");
+            if old_level.order_count == 0 {
+                old_slot.remove();
+            }
+
+            match levels.entry(record.price_px9) {
+                btree_map::Entry::Occupied(mut new_slot) => {
+                    let new_level = new_slot.get_mut();
+                    new_level.qty = after_add;
+                    new_level.order_count = new_level.order_count.checked_add(1).expect(
+                        "a price-level order count cannot exceed the total order map capacity",
+                    );
+                }
+                btree_map::Entry::Vacant(new_slot) => {
+                    new_slot.insert(Level {
+                        qty: after_add,
+                        order_count: 1,
+                    });
+                }
+            }
         }
-        self.set_level_qty(record.side, record.price_px9, new_level_qty);
 
         let priority_reset =
             record.price_px9 != order.price_px9 || record.size.get() > order.size.get();
-        let order = self
-            .orders
-            .get_mut(&record.order_id)
-            .expect("validated order remains present");
         order.price_px9 = record.price_px9;
         order.size = record.size;
         if priority_reset {
@@ -402,79 +447,44 @@ impl DisplayedBook {
         }
         Ok(())
     }
+}
 
-    fn checked_level_add(&self, side: MboSide, price: Px9, qty: Qty) -> Result<Qty, BookError> {
-        let current = self.level_qty(side, price);
-        current
-            .get()
-            .checked_add(qty.get())
-            .map(Qty::new)
-            .ok_or(BookError::LevelQuantityOverflow { side, price })
+fn side_levels<'a>(bids: &'a mut Levels, asks: &'a mut Levels, side: MboSide) -> &'a mut Levels {
+    match side {
+        MboSide::Bid => bids,
+        MboSide::Ask => asks,
+        MboSide::None => unreachable!("validated resting records must use book sides"),
     }
+}
 
-    fn checked_level_sub(&self, side: MboSide, price: Px9, qty: Qty) -> Result<Qty, BookError> {
-        let current = self.level_qty(side, price);
-        current.get().checked_sub(qty.get()).map(Qty::new).ok_or(
-            BookError::LevelQuantityUnderflow {
-                side,
-                price,
-                resting: current,
-                remove: qty,
-            },
-        )
-    }
+fn level_add(current: Qty, qty: Qty, side: MboSide, price: Px9) -> Result<Qty, BookError> {
+    current
+        .get()
+        .checked_add(qty.get())
+        .map(Qty::new)
+        .ok_or(BookError::LevelQuantityOverflow { side, price })
+}
 
-    fn level_qty(&self, side: MboSide, price: Px9) -> Qty {
-        match side {
-            MboSide::Bid => self.bids.get(&price).copied(),
-            MboSide::Ask => self.asks.get(&price).copied(),
-            MboSide::None => None,
-        }
-        .unwrap_or_default()
-    }
+fn level_sub(current: Qty, qty: Qty, side: MboSide, price: Px9) -> Result<Qty, BookError> {
+    current
+        .get()
+        .checked_sub(qty.get())
+        .map(Qty::new)
+        .ok_or(BookError::LevelQuantityUnderflow {
+            side,
+            price,
+            resting: current,
+            remove: qty,
+        })
+}
 
-    fn set_level_qty(&mut self, side: MboSide, price: Px9, qty: Qty) {
-        if qty.is_zero() {
-            self.levels_mut(side).remove(&price);
-        } else {
-            self.levels_mut(side).insert(price, qty);
-        }
-    }
-
-    fn levels_mut(&mut self, side: MboSide) -> &mut BTreeMap<Px9, Qty> {
-        match side {
-            MboSide::Bid => &mut self.bids,
-            MboSide::Ask => &mut self.asks,
-            MboSide::None => unreachable!("validated resting records must use book sides"),
-        }
-    }
-
-    fn increment_level_order_count(&mut self, side: MboSide, price: Px9) {
-        let count = self.order_counts_mut(side).entry(price).or_default();
-        *count = count
-            .checked_add(1)
-            .expect("a price-level order count cannot exceed the total order map capacity");
-    }
-
-    fn decrement_level_order_count(&mut self, side: MboSide, price: Px9) {
-        let counts = self.order_counts_mut(side);
-        let count = counts
-            .get_mut(&price)
-            .expect("quantity and order-count indexes must contain the same resting level");
-        *count = count
-            .checked_sub(1)
-            .expect("resting price-level order count cannot underflow");
-        if *count == 0 {
-            counts.remove(&price);
-        }
-    }
-
-    fn order_counts_mut(&mut self, side: MboSide) -> &mut BTreeMap<Px9, usize> {
-        match side {
-            MboSide::Bid => &mut self.bid_order_counts,
-            MboSide::Ask => &mut self.ask_order_counts,
-            MboSide::None => unreachable!("validated resting records must use book sides"),
-        }
+/// nothing is resting at this price, so there's no size to take off it.
+fn missing_level(side: MboSide, price: Px9, remove: Qty) -> BookError {
+    BookError::LevelQuantityUnderflow {
+        side,
+        price,
+        resting: Qty::new(0),
+        remove,
     }
 }
 
