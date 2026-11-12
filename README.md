@@ -2,7 +2,7 @@
 
 Rebuilds a CME futures order book order by order from Databento's
 market-by-order (level 3) data, fast enough to replay a typical ES trading day
-in about a second and a half.
+in under a second.
 
 You give it a day of raw exchange messages and it gives you the exact state of
 the book after every exchange event: best bid and ask, depth by price level,
@@ -37,7 +37,7 @@ To replay a real day, point it at a Databento MBO file (`.dbn` or
 `.dbn.zst`):
 
 ```
-cargo run --release --locked -p replay-smoke -- mbo glbx-mdp3-20250916.mbo.dbn.zst
+cargo run --release --locked -p replay-smoke -- mbo glbx-mdp3-20251231.mbo.dbn.zst
 ```
 
 Output for one ES session, trimmed:
@@ -47,16 +47,16 @@ status=ok
 mode=book_replay
 dataset=GLBX.MDP3
 symbols=ES.v.0
-mbo_records=4995152
-completed_events=4648879
-action_add=2051780
-action_cancel=2045196
-action_modify=660183
-action_trade=76872
-action_fill=161120
+mbo_records=6524920
+completed_events=5255874
+action_add=2584369
+action_cancel=2577265
+action_modify=503749
+action_trade=245047
+action_fill=614489
 maybe_bad_book_records=0
 book_replay=ok
-records_per_second=6939122
+records_per_second=16437832
 ```
 
 Add `--decode-only` to time reading the file without updating the book. No
@@ -67,6 +67,8 @@ market data is included in this repo. You can get MBO files from
 
 1. **Reading.** The file is decoded one record at a time in the order the
    exchange sent it, so a 5 million record day never has to fit in memory.
+   Compressed files are unpacked on a second thread while the first one
+   updates the book.
 2. **Book updates.** Adds, cancels, modifies and clears change the book.
    Trades and fills don't change it directly, because the filled size is
    removed by the cancel or modify message that comes right after.
@@ -90,11 +92,11 @@ A few design choices worth knowing about:
 
 ## Testing
 
-`cargo test --locked` runs 35 tests on synthetic data. They cover book
+`cargo test --locked` runs 37 tests on synthetic data. They cover book
 resets, invalid cancels (wrong side, wrong price, zero size, too large),
 cancels and modifies for orders that don't exist, modifies that change queue
-priority, trades that shouldn't touch the book, and files that end partway
-through an event.
+priority, trades that shouldn't touch the book, files that end partway
+through an event, and damaged compressed files.
 
 I also checked it against real data:
 
@@ -110,16 +112,28 @@ I also checked it against real data:
 
 ## Performance
 
-Release build on my machine, with full book updates, averaged over repeated
-runs:
+Release build on my machine, with full book updates, median of 7 runs:
 
 | ES day | Messages | Time | Messages per second |
 |---|---:|---:|---:|
-| Sep 16, 2025 (light) | 5.0 million | 0.7 s | 6.7 to 6.9 million |
-| Sep 26, 2025 (typical) | 11.3 million | 1.5 s | 7.7 million |
-| Nov 20, 2025 (busiest I have) | 34.2 million | 4.7 s | 7.2 million |
+| Dec 31, 2025 (light) | 6.5 million | 0.4 s | 17 million |
+| Dec 3, 2025 (typical) | 12.0 million | 0.75 s | 16 million |
+| Nov 20, 2025 (busiest I have) | 34.2 million | 2.3 s | 15 million |
 
-Your numbers will depend on your hardware and the file.
+Your numbers will depend on your hardware and the file. Reading a compressed
+file uses two CPU cores.
+
+Two things make the biggest difference:
+
+- **One lookup per price level.** The size and the order count at a price are
+  stored together, so each message only has to find its price level once.
+- **Unpacking on a second thread.** Decompressing the file takes about as long
+  as updating the book, so I run them on two cores at the same time. Records
+  still come out in file order.
+
+Here's what each one did on the busiest day:
+
+![Replay time for Nov 20, 2025: 4.7 s before, 3.9 s with one lookup per price level, 2.3 s with unpacking on a second thread too](docs/replay-time.svg)
 
 ## Limitations
 

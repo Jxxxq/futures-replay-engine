@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 264" width="760" height="264" role="img" aria-labelledby="chart-title chart-desc" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+  <title id="chart-title">Replaying the busiest day: 4.7 seconds before, 2.3 seconds now</title>
+  <desc id="chart-desc">Time to replay the ES session of Nov 20 2025, 34.2 million messages. Before: 1.9 seconds unpacking the zstd file, then 2.8 seconds decoding records and updating the book, 4.7 seconds in total. With one lookup per price level: 1.9 seconds, then 1.9 seconds, 3.9 seconds in total. With unpacking on a second thread as well, both jobs run at the same time and the replay takes 2.3 seconds.</desc>
+  <style>
+    .surface { fill: #fcfcfb; stroke: rgba(11, 11, 11, 0.10); }
+    .ink { fill: #0b0b0b; }
+    .ink-2 { fill: #52514e; }
+    .ink-3 { fill: #898781; }
+    .grid { stroke: #e1e0d9; }
+    .axis { stroke: #c3c2b7; }
+    .unpack { fill: #2a78d6; }
+    .book { fill: #eb6834; }
+    .total { paint-order: stroke; stroke: #fcfcfb; stroke-width: 5px; stroke-linejoin: round; }
+    @media (prefers-color-scheme: dark) {
+      .surface { fill: #1a1a19; stroke: rgba(255, 255, 255, 0.10); }
+      .ink { fill: #f0efec; }
+      .ink-2 { fill: #c3c2b7; }
+      .grid { stroke: #2c2c2a; }
+      .axis { stroke: #383835; }
+      .unpack { fill: #3987e5; }
+      .book { fill: #d95926; }
+      .total { stroke: #1a1a19; }
+    }
+  </style>
+
+  <rect class="surface" x="0.5" y="0.5" width="759" height="263" rx="8"/>
+
+  <text class="ink" x="24" y="33" font-size="15" font-weight="600">Replaying the busiest day: 4.7 s before, 2.3 s now</text>
+  <text class="ink-2" x="24" y="53" font-size="12">ES on Nov 20 2025, 34.2 million messages. Bar length is the time spent on each job.</text>
+
+  <rect class="unpack" x="24" y="69" width="10" height="10" rx="2"/>
+  <text class="ink-2" x="40" y="78.5" font-size="12">Unpacking the zstd file</text>
+  <rect class="book" x="192" y="69" width="10" height="10" rx="2"/>
+  <text class="ink-2" x="208" y="78.5" font-size="12">Decoding records and updating the book</text>
+
+  <!-- 96 px per second, zero at x=214 -->
+  <g class="grid" stroke-width="1">
+    <line x1="310.5" y1="96" x2="310.5" y2="232"/>
+    <line x1="406.5" y1="96" x2="406.5" y2="232"/>
+    <line x1="502.5" y1="96" x2="502.5" y2="232"/>
+    <line x1="598.5" y1="96" x2="598.5" y2="232"/>
+    <line x1="694.5" y1="96" x2="694.5" y2="232"/>
+  </g>
+  <line class="axis" x1="213.5" y1="96" x2="213.5" y2="232" stroke-width="1"/>
+  <g class="ink-3" font-size="11" text-anchor="middle">
+    <text x="214" y="249">0</text>
+    <text x="310" y="249">1 s</text>
+    <text x="406" y="249">2 s</text>
+    <text x="502" y="249">3 s</text>
+    <text x="598" y="249">4 s</text>
+    <text x="694" y="249">5 s</text>
+  </g>
+
+  <!-- before: 1.93 s unpacking, then 2.78 s on records and the book -->
+  <text class="ink" x="200" y="116" font-size="13" font-weight="600" text-anchor="end">Before</text>
+  <text class="ink-2" x="200" y="131" font-size="11" text-anchor="end">one job, then the other</text>
+  <rect class="unpack" x="214" y="107" width="184" height="22"/>
+  <path class="book" d="M400 107H662a4 4 0 0 1 4 4V125a4 4 0 0 1-4 4H400Z"/>
+  <text class="ink total" x="674" y="122.5" font-size="13" font-weight="600">4.7 s</text>
+
+  <!-- one lookup per level: 1.93 s unpacking, then 1.94 s -->
+  <text class="ink" x="200" y="162" font-size="13" font-weight="600" text-anchor="end">One lookup per level</text>
+  <text class="ink-2" x="200" y="177" font-size="11" text-anchor="end">size and order count together</text>
+  <rect class="unpack" x="214" y="153" width="184" height="22"/>
+  <path class="book" d="M400 153H582a4 4 0 0 1 4 4V171a4 4 0 0 1-4 4H400Z"/>
+  <text class="ink total" x="594" y="168.5" font-size="13" font-weight="600">3.9 s</text>
+
+  <!-- second thread: 1.93 s unpacking alongside 2.30 s on records and the book -->
+  <text class="ink" x="200" y="208" font-size="13" font-weight="600" text-anchor="end">Unpack on a second thread</text>
+  <text class="ink-2" x="200" y="223" font-size="11" text-anchor="end">both jobs at the same time</text>
+  <path class="unpack" d="M214 199H395a4 4 0 0 1 4 4V205a4 4 0 0 1-4 4H214Z"/>
+  <path class="book" d="M214 211H431a4 4 0 0 1 4 4V217a4 4 0 0 1-4 4H214Z"/>
+  <text class="ink total" x="443" y="214.5" font-size="13" font-weight="600">2.3 s</text>
+</svg>
